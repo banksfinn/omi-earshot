@@ -53,6 +53,14 @@ LOG_MODULE_REGISTER(storage, CONFIG_LOG_DEFAULT_LEVEL);
  * packets the phone has confirmed receiving (incremental auto-save). */
 #define STORAGE_ADVANCE_CHECKPOINT_MS 2000
 
+/* Auto-advance holds back this many packets (~6 s of audio). A notification
+ * counts as sent once the controller acks it, but the phone's host stack can
+ * still drop it when the link goes (2026-10-07: ~10 packets per mid-sync
+ * disconnect never reached the app, and were freed here anyway). The phone
+ * tracks ring seqs, so it skips the re-read overlap; its explicit ADVANCE after
+ * a complete drain frees the rest. */
+#define STORAGE_ADVANCE_MARGIN_PACKETS 64
+
 static void storage_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t storage_write_handler(struct bt_conn *conn,
                                      const struct bt_gatt_attr *attr,
@@ -414,9 +422,10 @@ static void sync_status_account_freed(uint64_t delta)
 static void sync_checkpoint_advance(bool force)
 {
     uint64_t confirmed = sync_confirmed_seq();
-    if (confirmed <= sync_checkpoint_seq) {
+    if (confirmed <= sync_checkpoint_seq + STORAGE_ADVANCE_MARGIN_PACKETS) {
         return;
     }
+    confirmed -= STORAGE_ADVANCE_MARGIN_PACKETS;
 
     int64_t now = k_uptime_get();
     if (!force && now < sync_checkpoint_deadline_ms) {
