@@ -150,8 +150,8 @@ static inline void notify_long_tap()
 #define BUTTON_PRESSED 1
 #define BUTTON_RELEASED 0
 
-#define TAP_THRESHOLD 300     // 300 ms for single tap
-#define DOUBLE_TAP_WINDOW 600 // 600 ms maximum for double-tap
+#define TAP_THRESHOLD 300  // a press shorter than this is a tap
+#define DOUBLE_TAP_GAP 400 // a second press within this long after a tap's release makes a double tap
 #define LONG_PRESS_TIME 3000  // 3000 ms for long press (power off)
 
 typedef enum {
@@ -186,26 +186,32 @@ void check_button_level(struct k_work *work_item)
         btn_is_pressed = false;
         btn_release_time = current_time;
 
-        // Check for double tap
+        // A tap while an earlier tap is still pending is a double tap. btn_last_tap_time is
+        // the pending tap's release; it is only still set if this press began within
+        // DOUBLE_TAP_GAP of it (otherwise the single tap below already fired).
         uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
         if (press_duration < TAP_THRESHOLD) {
-            if (btn_last_tap_time > 0 &&
-                (current_time - btn_last_tap_time) * BUTTON_CHECK_INTERVAL < DOUBLE_TAP_WINDOW) {
+            if (btn_last_tap_time > 0) {
                 event = BUTTON_EVENT_DOUBLE_TAP;
-                btn_last_tap_time = 0; // Reset double-tap / single-tap detection
+                btn_last_tap_time = 0;
             } else {
                 btn_last_tap_time = current_time;
             }
+        } else {
+            btn_last_tap_time = 0; // a hold is not a tap and cancels a pending one
         }
     }
 
-    // Check for single tap
-    if (btn_state == BUTTON_RELEASED && !btn_is_pressed) {
-        uint32_t press_duration = (btn_release_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL;
-        if (press_duration < TAP_THRESHOLD && btn_last_tap_time > 0 &&
-            (current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
-            event = BUTTON_EVENT_SINGLE_TAP;
-            btn_last_tap_time = 0;
+    // Single tap: a tap with no second press within DOUBLE_TAP_GAP of its release. Upstream
+    // timed this from the first press's start (300 ms), so a double tap needed its second
+    // press within ~300 ms of the first; a normal-speed double tap came out as two single
+    // taps, i.e. mute on + mute off and no End Conversation.
+    if (btn_state == BUTTON_RELEASED && !btn_is_pressed && event == BUTTON_EVENT_NONE) {
+        if (btn_last_tap_time > 0) {
+            if ((current_time - btn_last_tap_time) * BUTTON_CHECK_INTERVAL > DOUBLE_TAP_GAP) {
+                event = BUTTON_EVENT_SINGLE_TAP;
+                btn_last_tap_time = 0;
+            }
         } else if ((current_time - btn_press_start_time) * BUTTON_CHECK_INTERVAL > TAP_THRESHOLD) {
             event = BUTTON_EVENT_RELEASE;
         }
