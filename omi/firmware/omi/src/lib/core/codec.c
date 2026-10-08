@@ -30,10 +30,22 @@ void set_codec_callback(codec_callback callback)
 uint8_t codec_ring_buffer_data[AUDIO_BUFFER_SAMPLES * 2]; // 2 bytes per sample
 struct ring_buf codec_ring_buf;
 K_SEM_DEFINE(codec_data_sem, 0, NETWORK_RING_BUF_SIZE);
+
+/* Capture clock. The mic hands over a block when its last sample is captured, so
+ * the uptime at the newest put is the capture time just past the ring's newest
+ * sample. A frame's first sample is then that time minus everything still queued
+ * (16 samples per ms at 16 kHz). The lock keeps the (queued size, tail time) pair
+ * consistent between the mic thread and the codec thread. */
+#define CODEC_SAMPLES_PER_MS 16
+static struct k_spinlock codec_ring_lock;
+static int64_t codec_ring_tail_uptime_ms;
+
 int codec_receive_pcm(int16_t *data, size_t len) // this gets called after mic data is finished
 {
-
+    k_spinlock_key_t key = k_spin_lock(&codec_ring_lock);
     int written = ring_buf_put(&codec_ring_buf, (uint8_t *) data, len * 2);
+    codec_ring_tail_uptime_ms = k_uptime_get();
+    k_spin_unlock(&codec_ring_lock, key);
     if (written != len * 2) {
         LOG_ERR("Failed to write %d bytes to codec ring buffer", len * 2);
         return -1;
@@ -74,15 +86,19 @@ void codec_entry()
         k_sem_take(&codec_data_sem, K_FOREVER);
 
         while (ring_buf_size_get(&codec_ring_buf) >= CODEC_PACKAGE_SAMPLES * 2) {
-            // Read package
+            // Read package, and the capture time of its first sample
+            k_spinlock_key_t key = k_spin_lock(&codec_ring_lock);
+            uint32_t queued_samples = ring_buf_size_get(&codec_ring_buf) / 2;
+            int64_t capture_uptime_ms = codec_ring_tail_uptime_ms - queued_samples / CODEC_SAMPLES_PER_MS;
             ring_buf_get(&codec_ring_buf, (uint8_t *) codec_input_samples, CODEC_PACKAGE_SAMPLES * 2);
+            k_spin_unlock(&codec_ring_lock, key);
 
             // Run Codec
             output_size = execute_codec();
 
             // Notify
             if (_callback) {
-                _callback(codec_output_bytes, output_size);
+                _callback(codec_output_bytes, output_size, capture_uptime_ms);
             }
         }
     }

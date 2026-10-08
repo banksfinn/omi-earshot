@@ -18,6 +18,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/ring_buffer.h>
 
 #include "accel.h"
@@ -65,6 +66,9 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
 
 static struct bt_conn_cb _callback_references;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
+static void audio_clock_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
+// The pusher sends an audio-clock anchor before the next frame it streams.
+static atomic_t audio_clock_anchor_requested;
 static ssize_t audio_data_read_characteristic(struct bt_conn *conn,
                                               const struct bt_gatt_attr *attr,
                                               void *buf,
@@ -131,6 +135,12 @@ K_WORK_DELAYABLE_DEFINE(mtu_recheck_work, mtu_recheck_work_handler);
 // exposes following characteristics:
 // - Audio data (UUID 19B10001-E8F2-537E-4F6C-D104768A1214) to send audio data (read/notify)
 // - Audio codec (UUID 19B10002-E8F2-537E-4F6C-D104768A1214) to send audio codec type (read)
+// - Audio clock (UUID 19B10004-E8F2-537E-4F6C-D104768A1214) capture-time anchors (notify):
+//   [packet id u16 LE][capture ms u64 LE][flags u8]. The id is the 19B10001 packet id
+//   of a frame's first packet; the time is that frame's first sample. flags bit0 = RTC
+//   valid: the time is pendant UTC epoch ms, otherwise uptime ms. Sent before that
+//   packet, on subscribe, on any capture-time discontinuity and every ~50 frames.
+//   (19B10003 is the speaker characteristic, so the clock takes 19B10004.)
 // TODO: The current audio service UUID seems to come from old Intel sample code,
 // we should change it to UUID 814b9b7c-25fd-4acd-8604-d28877beee6d
 static struct bt_uuid_128 audio_service_uuid =
@@ -139,6 +149,8 @@ static struct bt_uuid_128 audio_characteristic_data_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10001, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_format_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10002, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 audio_characteristic_clock_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10004, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
@@ -157,6 +169,13 @@ static struct bt_gatt_attr audio_service_attr[] = {
                            audio_codec_read_characteristic,
                            NULL,
                            NULL),
+    BT_GATT_CHARACTERISTIC(&audio_characteristic_clock_uuid.uuid,
+                           BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_NONE,
+                           NULL,
+                           NULL,
+                           NULL),
+    BT_GATT_CCC(audio_clock_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 #ifdef CONFIG_OMI_ENABLE_SPEAKER
     BT_GATT_CHARACTERISTIC(&audio_characteristic_speaker_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
@@ -170,6 +189,8 @@ static struct bt_gatt_attr audio_service_attr[] = {
 };
 
 static struct bt_gatt_service audio_service = BT_GATT_SERVICE(audio_service_attr);
+// audio_service_attr index of the clock characteristic's declaration.
+#define AUDIO_CLOCK_ATTR_INDEX 6
 
 // --- Settings Service ---
 static struct bt_uuid_128 settings_service_uuid =
@@ -315,12 +336,22 @@ static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, ui
     // live-vs-SD per frame with bt_gatt_is_subscribed().
     is_audio_subscribed = (value == BT_GATT_CCC_NOTIFY);
     if (value == BT_GATT_CCC_NOTIFY) {
+        atomic_set(&audio_clock_anchor_requested, 1);
         LOG_INF("Client subscribed for notifications");
     } else if (value == 0) {
         LOG_INF("Client unsubscribed from notifications");
     } else {
         LOG_INF("Invalid CCC value: %u", value);
     }
+}
+
+static void audio_clock_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    ARG_UNUSED(attr);
+    if (value == BT_GATT_CCC_NOTIFY) {
+        atomic_set(&audio_clock_anchor_requested, 1);
+    }
+    LOG_INF("Audio clock notifications %s", value == BT_GATT_CCC_NOTIFY ? "on" : "off");
 }
 
 static void charging_status_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
@@ -975,16 +1006,22 @@ static int ensure_local_ble_identity(void)
 // Ring Buffer
 //
 
+// Ring entry: [size u16 LE][clock flags u8][capture ms u64 LE][frame bytes].
 #define NET_BUFFER_HEADER_SIZE 3
-#define RING_BUFFER_HEADER_SIZE 2
+#define RING_BUFFER_HEADER_SIZE 11
+#define AUDIO_CLOCK_FLAG_RTC_VALID 0x01
 static uint8_t tx_queue[NETWORK_RING_BUF_SIZE * (CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE)];
 static uint8_t tx_buffer[CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE];
 static uint8_t tx_buffer_2[CODEC_OUTPUT_MAX_BYTES + RING_BUFFER_HEADER_SIZE];
 static uint32_t tx_buffer_size = 0;
+// Capture time of the frame in tx_buffer: pendant UTC ms if tx_frame_clock_flags has
+// AUDIO_CLOCK_FLAG_RTC_VALID, otherwise uptime ms.
+static uint64_t tx_frame_capture_ms = 0;
+static uint8_t tx_frame_clock_flags = 0;
 static struct ring_buf ring_buf;
 K_SEM_DEFINE(tx_queue_sem, 0, NETWORK_RING_BUF_SIZE);
 
-static bool write_to_tx_queue(uint8_t *data, size_t size)
+static bool write_to_tx_queue(uint8_t *data, size_t size, uint64_t capture_ms, uint8_t clock_flags)
 {
 #ifdef CONFIG_OMI_ENABLE_MONITOR
     // Increment the counter
@@ -996,8 +1033,9 @@ static bool write_to_tx_queue(uint8_t *data, size_t size)
     }
 
     // Copy data (TODO: Avoid this copy)
-    tx_buffer_2[0] = size & 0xFF;
-    tx_buffer_2[1] = (size >> 8) & 0xFF;
+    sys_put_le16((uint16_t) size, tx_buffer_2);
+    tx_buffer_2[2] = clock_flags;
+    sys_put_le64(capture_ms, tx_buffer_2 + 3);
     memcpy(tx_buffer_2 + RING_BUFFER_HEADER_SIZE, data, size);
 
     // Write to ring buffer
@@ -1025,8 +1063,9 @@ static bool read_from_tx_queue()
         return false;
     }
 
-    // Adjust size
-    tx_buffer_size = tx_buffer[0] + (tx_buffer[1] << 8);
+    tx_buffer_size = sys_get_le16(tx_buffer);
+    tx_frame_clock_flags = tx_buffer[2];
+    tx_frame_capture_ms = sys_get_le64(tx_buffer + 3);
 
     return true;
 }
@@ -1077,6 +1116,78 @@ static uint8_t pusher_temp_data[MAX_POSSIBLE_MTU];
 #define AUDIO_TX_STALL_MS 100
 static bool audio_link_stalled;
 
+/* Audio clock anchors (see the 19B10004 comment at the top). The phone times the
+ * frames between anchors at AUDIO_FRAME_MS each, so an anchor goes out whenever
+ * that would be wrong: the first frame after subscribe, and any frame whose capture
+ * time doesn't follow the last streamed frame's (stall to SD, mute, mic sleep, RTC
+ * set). A periodic one every AUDIO_CLOCK_ANCHOR_FRAMES bounds the phone's error.
+ * An anchor takes an audio TX slot without waiting; with none free it goes with
+ * the next frame instead. */
+#define AUDIO_FRAME_MS 20
+#define AUDIO_FRAME_JITTER_MS 8
+#define AUDIO_CLOCK_ANCHOR_FRAMES 50
+static bool audio_clock_anchor_pending;
+static uint32_t frames_since_clock_anchor;
+static bool last_streamed_frame_known;
+static uint64_t last_streamed_capture_ms;
+static uint8_t last_streamed_clock_flags;
+
+static bool streamed_frame_is_continuous(void)
+{
+    if (!last_streamed_frame_known || tx_frame_clock_flags != last_streamed_clock_flags) {
+        return false;
+    }
+    int64_t step_ms = (int64_t) (tx_frame_capture_ms - last_streamed_capture_ms);
+    return step_ms >= AUDIO_FRAME_MS - AUDIO_FRAME_JITTER_MS && step_ms <= AUDIO_FRAME_MS + AUDIO_FRAME_JITTER_MS;
+}
+
+static bool send_audio_clock_anchor(struct bt_conn *conn, uint16_t packet_id)
+{
+    const struct bt_gatt_attr *attr = &audio_service.attrs[AUDIO_CLOCK_ATTR_INDEX];
+    if (!bt_gatt_is_subscribed(conn, attr, BT_GATT_CCC_NOTIFY)) {
+        return false;
+    }
+    if (k_sem_take(&audio_tx_sem, K_NO_WAIT) != 0) {
+        return false;
+    }
+
+    uint8_t payload[11];
+    sys_put_le16(packet_id, payload);
+    sys_put_le64(tx_frame_capture_ms, payload + 2);
+    payload[10] = tx_frame_clock_flags;
+    struct bt_gatt_notify_params params = {
+        .attr = attr,
+        .data = payload,
+        .len = sizeof(payload),
+        .func = on_audio_tx_done,
+        .user_data = NULL,
+    };
+    if (bt_gatt_notify_cb(conn, &params) != 0) {
+        k_sem_give(&audio_tx_sem);
+        return false;
+    }
+    return true;
+}
+
+/* Called once the frame's first packet slot is held, before that packet is built. */
+static void maybe_send_audio_clock_anchor(struct bt_conn *conn)
+{
+    if (atomic_clear(&audio_clock_anchor_requested)) {
+        last_streamed_frame_known = false;
+    }
+    if (!streamed_frame_is_continuous() || frames_since_clock_anchor >= AUDIO_CLOCK_ANCHOR_FRAMES) {
+        audio_clock_anchor_pending = true;
+    }
+    if (audio_clock_anchor_pending && send_audio_clock_anchor(conn, packet_next_index)) {
+        audio_clock_anchor_pending = false;
+        frames_since_clock_anchor = 0;
+    }
+    frames_since_clock_anchor++;
+    last_streamed_frame_known = true;
+    last_streamed_capture_ms = tx_frame_capture_ms;
+    last_streamed_clock_flags = tx_frame_clock_flags;
+}
+
 /* 0 = sent; -EAGAIN = nothing of this frame was sent (store it); -EIO = a later
  * packet of the frame failed (partly sent, dropped as before). */
 static int push_to_gatt(struct bt_conn *conn)
@@ -1100,6 +1211,7 @@ static int push_to_gatt(struct bt_conn *conn)
                 return -EAGAIN;
             }
             audio_link_stalled = false;
+            maybe_send_audio_clock_anchor(conn);
         } else {
             k_sem_take(&audio_tx_sem, K_FOREVER);
         }
@@ -1162,10 +1274,42 @@ static uint16_t buffer_offset = 0;
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 static uint8_t storage_temp_data[MAX_WRITE_SIZE];
+/* UTC seconds of the first frame in storage_temp_data (0 = RTC wasn't valid at capture;
+ * the SD layer then stamps the write time), and the last stored frame's capture time so
+ * a record never spans a capture gap. */
+static uint32_t storage_record_capture_s;
+static bool storage_last_frame_known;
+static uint64_t storage_last_capture_ms;
+static uint8_t storage_last_clock_flags;
+
+static void flush_partial_storage_record(void);
+
+static uint32_t tx_frame_capture_utc_s(void)
+{
+    if (!(tx_frame_clock_flags & AUDIO_CLOCK_FLAG_RTC_VALID)) {
+        return 0;
+    }
+    return (uint32_t) (tx_frame_capture_ms / 1000ULL);
+}
+
 bool write_to_storage(void)
 {
-    uint8_t *buffer = tx_buffer + 2;
+    uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint8_t packet_size = (uint8_t) (tx_buffer_size + OPUS_PREFIX_LENGTH);
+
+    int64_t step_ms = (int64_t) (tx_frame_capture_ms - storage_last_capture_ms);
+    bool is_continuous = storage_last_frame_known && tx_frame_clock_flags == storage_last_clock_flags &&
+                         step_ms >= AUDIO_FRAME_MS - AUDIO_FRAME_JITTER_MS &&
+                         step_ms <= AUDIO_FRAME_MS + AUDIO_FRAME_JITTER_MS;
+    if (!is_continuous) {
+        flush_partial_storage_record();
+    }
+    storage_last_frame_known = true;
+    storage_last_capture_ms = tx_frame_capture_ms;
+    storage_last_clock_flags = tx_frame_clock_flags;
+    if (buffer_offset == 0) {
+        storage_record_capture_s = tx_frame_capture_utc_s();
+    }
 
     // buffer_offset = buffer_offset+amount_to_fill;
     // check if adding the new packet will cause a overflow
@@ -1173,8 +1317,9 @@ bool write_to_storage(void)
 
         storage_temp_data[buffer_offset] = tx_buffer_size;
         uint8_t *write_ptr = storage_temp_data;
-        write_to_file(write_ptr, MAX_WRITE_SIZE);
+        write_to_file(write_ptr, MAX_WRITE_SIZE, storage_record_capture_s);
 
+        storage_record_capture_s = tx_frame_capture_utc_s();
         buffer_offset = packet_size;
         storage_temp_data[0] = tx_buffer_size;
         memcpy(storage_temp_data + 1, buffer, tx_buffer_size);
@@ -1185,7 +1330,7 @@ bool write_to_storage(void)
         memcpy(storage_temp_data + buffer_offset + 1, buffer, tx_buffer_size);
         buffer_offset = 0;
         uint8_t *write_ptr = (uint8_t *) storage_temp_data;
-        write_to_file(write_ptr, MAX_WRITE_SIZE);
+        write_to_file(write_ptr, MAX_WRITE_SIZE, storage_record_capture_s);
     } else {
         storage_temp_data[buffer_offset] = tx_buffer_size;
         memcpy(storage_temp_data + buffer_offset + 1, buffer, tx_buffer_size);
@@ -1208,7 +1353,7 @@ static void flush_partial_storage_record(void)
         return;
     }
     memset(storage_temp_data + buffer_offset, 0, MAX_WRITE_SIZE - buffer_offset);
-    write_to_file(storage_temp_data, MAX_WRITE_SIZE);
+    write_to_file(storage_temp_data, MAX_WRITE_SIZE, storage_record_capture_s);
     buffer_offset = 0;
 }
 #endif
@@ -1285,14 +1430,19 @@ void pusher(void)
             }
 
             if (is_subscribed) {
+                int sent = push_to_gatt(conn);
+                if (sent == -EAGAIN) {
+                    store_audio_frame();
+                }
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-                if (is_sd_on()) {
+                // Live again: hand any partial SD record (audio stored while
+                // connecting or stalled) to the ring so the app's drain sees it.
+                // Flushing only after a live frame keeps a stall's frames packed
+                // in full records instead of one padded record per frame.
+                else if (is_sd_on()) {
                     flush_partial_storage_record();
                 }
 #endif
-                if (push_to_gatt(conn) == -EAGAIN) {
-                    store_audio_frame();
-                }
             } else {
                 // No phone, or a phone that is not streaming audio yet (still
                 // discovering / subscribing, or MTU too small): keep the frame on
@@ -1505,9 +1655,17 @@ struct bt_conn *get_current_connection()
     return current_connection;
 }
 
-int broadcast_audio_packets(uint8_t *buffer, size_t size)
+int broadcast_audio_packets(uint8_t *buffer, size_t size, int64_t capture_uptime_ms)
 {
-    if (!write_to_tx_queue(buffer, size)) {
+    // Capture clock: pendant UTC ms when the RTC is set, else uptime ms.
+    uint64_t capture_ms = (uint64_t) capture_uptime_ms;
+    uint8_t clock_flags = 0;
+    uint64_t utc_now_ms = rtc_get_utc_time_ms();
+    if (utc_now_ms != 0) {
+        capture_ms = utc_now_ms - (uint64_t) (k_uptime_get() - capture_uptime_ms);
+        clock_flags = AUDIO_CLOCK_FLAG_RTC_VALID;
+    }
+    if (!write_to_tx_queue(buffer, size, capture_ms, clock_flags)) {
         return -1;
     }
     return 0;

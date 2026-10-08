@@ -27,9 +27,10 @@ int transport_off();
  *
  * @param buffer Buffer containing audio data
  * @param size Size of the audio data
+ * @param capture_uptime_ms k_uptime_get() at the frame's first sample
  * @return 0 if successful, negative errno code if error
  */
-int broadcast_audio_packets(uint8_t *buffer, size_t size);
+int broadcast_audio_packets(uint8_t *buffer, size_t size, int64_t capture_uptime_ms);
 
 /**
  * @brief Get the current BLE connection

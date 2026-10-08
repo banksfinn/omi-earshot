@@ -127,14 +127,18 @@ static inline void notify_tap()
     }
 }
 
-static inline void notify_double_tap()
+/* The second int carries how long ago the double tap began (its first press), in ms,
+ * so the app can time End Conversation at the press rather than at this notify. */
+static inline void notify_double_tap(uint32_t age_ms)
 {
     final_button_state[0] = DOUBLE_TAP; // button press
+    final_button_state[1] = (int) age_ms;
     LOG_INF("Button double tap");
     struct bt_conn *conn = get_current_connection();
     if (conn != NULL) {
         bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
     }
+    final_button_state[1] = 0;
 }
 
 static inline void notify_long_tap()
@@ -166,6 +170,7 @@ static uint32_t current_time = 0;
 static uint32_t btn_press_start_time;
 static uint32_t btn_release_time;
 static uint32_t btn_last_tap_time;
+static uint32_t btn_pending_tap_press_time; // press start of the tap btn_last_tap_time ended
 static bool btn_is_pressed;
 
 static u_int8_t btn_last_event = BUTTON_EVENT_NONE;
@@ -196,6 +201,7 @@ void check_button_level(struct k_work *work_item)
                 btn_last_tap_time = 0;
             } else {
                 btn_last_tap_time = current_time;
+                btn_pending_tap_press_time = btn_press_start_time;
             }
         } else {
             btn_last_tap_time = 0; // a hold is not a tap and cancels a pending one
@@ -238,7 +244,7 @@ void check_button_level(struct k_work *work_item)
     if (event == BUTTON_EVENT_DOUBLE_TAP) {
         LOG_INF("double tap detected\n");
         btn_last_event = event;
-        notify_double_tap();
+        notify_double_tap((current_time - btn_pending_tap_press_time) * BUTTON_CHECK_INTERVAL);
     }
 
     // Long press, one time event

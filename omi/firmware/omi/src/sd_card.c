@@ -124,6 +124,7 @@ typedef struct {
         struct {
             uint8_t buf[MAX_WRITE_SIZE];
             size_t len;
+            uint32_t capture_utc_s;
         } write;
         struct {
             uint64_t start_seq;
@@ -681,7 +682,12 @@ static void process_write_data_req(const sd_req_t *req)
         return;
     }
 
-    uint32_t timestamp = get_utc_time();
+    /* Records carry the capture time of their first frame, the same clock the live
+     * stream's audio-clock anchors use. Write time is only the fallback. */
+    uint32_t timestamp = req->u.write.capture_utc_s;
+    if (timestamp < 1700000000U) {
+        timestamp = get_utc_time();
+    }
     if (timestamp == 0U || timestamp < 1700000000U) {
         return;
     }
@@ -1225,7 +1231,7 @@ void sd_notify_ble_state(bool connected)
     ble_connected = connected;
 }
 
-uint32_t write_to_file(uint8_t *data, uint32_t length)
+uint32_t write_to_file(uint8_t *data, uint32_t length, uint32_t capture_utc_s)
 {
     static int64_t last_write_err_log_ms;
     static int64_t last_shutdown_drop_log_ms;
@@ -1266,6 +1272,7 @@ uint32_t write_to_file(uint8_t *data, uint32_t length)
     req.type = REQ_WRITE_DATA;
     memcpy(req.u.write.buf, data, length);
     req.u.write.len = length;
+    req.u.write.capture_utc_s = capture_utc_s;
 
     int ret = k_msgq_put(&sd_msgq, &req, K_NO_WAIT);
     if (ret != 0) {

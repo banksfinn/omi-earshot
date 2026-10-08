@@ -38,7 +38,8 @@ void sd_request_power(bool on);
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 
-uint32_t write_to_file(uint8_t *data, uint32_t length);
+/* capture_utc_s: UTC seconds of the record's first frame (0 = unknown, stamp at write). */
+uint32_t write_to_file(uint8_t *data, uint32_t length, uint32_t capture_utc_s);
 
 int sd_ring_get_info(sd_ring_info_t *info);
 int sd_ring_read(uint64_t start_seq, uint8_t *buf, uint32_t max_bytes, uint32_t *bytes_read, uint32_t *packets_read);

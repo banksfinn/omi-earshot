@@ -68,12 +68,12 @@ static void print_reset_reason(void)
     }
 }
 
-static void codec_handler(uint8_t *data, size_t len)
+static void codec_handler(uint8_t *data, size_t len, int64_t capture_uptime_ms)
 {
 #ifdef CONFIG_OMI_ENABLE_MONITOR
     monitor_inc_broadcast_audio();
 #endif
-    int err = broadcast_audio_packets(data, len);
+    int err = broadcast_audio_packets(data, len, capture_uptime_ms);
     if (err) {
 #ifdef CONFIG_OMI_ENABLE_MONITOR
         monitor_inc_broadcast_audio_failed();
