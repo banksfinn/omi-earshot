@@ -1068,7 +1068,18 @@ static uint16_t packet_next_index = 0;
 #define MAX_POSSIBLE_MTU 517
 static uint8_t pusher_temp_data[MAX_POSSIBLE_MTU];
 
-static bool push_to_gatt(struct bt_conn *conn)
+/* A stalled link (the phone stopped acking: walking out of range, before the
+ * supervision timeout ends the connection) holds every TX slot. Waiting forever
+ * here let the 0.64 s tx queue overflow and the codec drop every frame until the
+ * disconnect landed (2026-10-07: ~7 s lost per dropout). A frame whose first
+ * packet can't get a slot within AUDIO_TX_STALL_MS goes to the SD ring instead;
+ * while stalled, later frames don't wait at all. */
+#define AUDIO_TX_STALL_MS 100
+static bool audio_link_stalled;
+
+/* 0 = sent; -EAGAIN = nothing of this frame was sent (store it); -EIO = a later
+ * packet of the frame failed (partly sent, dropped as before). */
+static int push_to_gatt(struct bt_conn *conn)
 {
     uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint32_t offset = 0;
@@ -1082,7 +1093,16 @@ static bool push_to_gatt(struct bt_conn *conn)
         // Block until a throttle slot is available. This preserves every audio
         // packet while still guaranteeing AUDIO_TX_RESERVED_SLOTS remain free
         // for battery/diagnostic/status notifications at all times.
-        k_sem_take(&audio_tx_sem, K_FOREVER);
+        if (index == 0) {
+            k_timeout_t wait = audio_link_stalled ? K_NO_WAIT : K_MSEC(AUDIO_TX_STALL_MS);
+            if (k_sem_take(&audio_tx_sem, wait) != 0) {
+                audio_link_stalled = true;
+                return -EAGAIN;
+            }
+            audio_link_stalled = false;
+        } else {
+            k_sem_take(&audio_tx_sem, K_FOREVER);
+        }
 
         uint32_t id = packet_next_index++;
         pusher_temp_data[0] = id & 0xFF;
@@ -1128,11 +1148,11 @@ static bool push_to_gatt(struct bt_conn *conn)
             // bt_gatt_notify_cb never succeeded so its callback will never fire;
             // release the throttle slot manually.
             k_sem_give(&audio_tx_sem);
-            return false;
+            return index == 1 ? -EAGAIN : -EIO;
         }
     }
 
-    return true;
+    return 0;
 }
 
 #define OPUS_PREFIX_LENGTH 1
@@ -1218,7 +1238,7 @@ void test_pusher(void)
         }
         if (valid) {
             // Expected 100 packages per seconds
-            bool sent = push_to_gatt(conn);
+            bool sent = push_to_gatt(conn) == 0;
             if (!sent) {
                 // k_sleep(K_MSEC(50));
             }
@@ -1229,6 +1249,20 @@ void test_pusher(void)
         runs_count++;
         k_yield();
     }
+}
+
+/* The frame in tx_buffer → the SD ring (drained by the app later). */
+static void store_audio_frame(void)
+{
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    if (is_sd_on()) {
+        storage_full_warned = false;
+        write_to_storage();
+    } else if (!storage_full_warned) {
+        LOG_WRN("Offline storage unavailable");
+        storage_full_warned = true;
+    }
+#endif
 }
 
 void pusher(void)
@@ -1256,22 +1290,14 @@ void pusher(void)
                     flush_partial_storage_record();
                 }
 #endif
-                push_to_gatt(conn);
+                if (push_to_gatt(conn) == -EAGAIN) {
+                    store_audio_frame();
+                }
             } else {
                 // No phone, or a phone that is not streaming audio yet (still
                 // discovering / subscribing, or MTU too small): keep the frame on
                 // the SD ring for the app's drain instead of dropping it.
-#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-                if (is_sd_on()) {
-                    storage_full_warned = false;
-                    write_to_storage();
-                } else {
-                    if (!storage_full_warned) {
-                        LOG_WRN("Offline storage unavailable");
-                        storage_full_warned = true;
-                    }
-                }
-#endif
+                store_audio_frame();
             }
 
             if (conn) {
