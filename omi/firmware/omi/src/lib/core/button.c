@@ -17,6 +17,7 @@
 #include "led.h"
 #include "mic.h"
 #include "speaker.h"
+#include <string.h>
 #include "transport.h"
 #include "wdog_facade.h"
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
@@ -127,18 +128,61 @@ static inline void notify_tap()
     }
 }
 
+/* A double tap the phone didn't get (out of range, not yet subscribed) is kept and
+ * sent once it is listening, with its age, so End Conversation still lands at the
+ * press (2026-10-08: a double tap during a dropout was simply lost). Only double taps
+ * queue: single tap = mute acts on the pendant itself. Uptime of each first press. */
+#define PENDING_DOUBLE_TAPS 4
+#define PENDING_DOUBLE_TAP_MAX_AGE_MS (30 * 60 * 1000)
+static int64_t pending_double_taps[PENDING_DOUBLE_TAPS];
+static uint8_t pending_double_tap_count;
+
+static bool send_double_tap(uint32_t age_ms)
+{
+    struct bt_conn *conn = get_current_connection();
+    if (conn == NULL || !bt_gatt_is_subscribed(conn, &button_service.attrs[1], BT_GATT_CCC_NOTIFY)) {
+        return false;
+    }
+    final_button_state[0] = DOUBLE_TAP;
+    final_button_state[1] = (int) age_ms;
+    int err = bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
+    final_button_state[1] = 0;
+    return err == 0;
+}
+
 /* The second int carries how long ago the double tap began (its first press), in ms,
  * so the app can time End Conversation at the press rather than at this notify. */
 static inline void notify_double_tap(uint32_t age_ms)
 {
-    final_button_state[0] = DOUBLE_TAP; // button press
-    final_button_state[1] = (int) age_ms;
     LOG_INF("Button double tap");
-    struct bt_conn *conn = get_current_connection();
-    if (conn != NULL) {
-        bt_gatt_notify(conn, &button_service.attrs[1], &final_button_state, sizeof(final_button_state));
+    if (pending_double_tap_count == 0 && send_double_tap(age_ms)) {
+        return;
     }
-    final_button_state[1] = 0;
+    if (pending_double_tap_count == PENDING_DOUBLE_TAPS) {
+        // Keep the newest: shift the oldest out.
+        memmove(&pending_double_taps[0], &pending_double_taps[1],
+                sizeof(pending_double_taps[0]) * (PENDING_DOUBLE_TAPS - 1));
+        pending_double_tap_count--;
+    }
+    pending_double_taps[pending_double_tap_count++] = k_uptime_get() - (int64_t) age_ms;
+    LOG_INF("Double tap queued until the phone listens (%u pending)", pending_double_tap_count);
+}
+
+/* Called every button tick: deliver queued double taps, oldest first, in order. */
+static void flush_pending_double_taps(void)
+{
+    while (pending_double_tap_count > 0) {
+        int64_t age = k_uptime_get() - pending_double_taps[0];
+        if (age <= PENDING_DOUBLE_TAP_MAX_AGE_MS) {
+            if (!send_double_tap((uint32_t) age)) {
+                return;  // not listening yet; try next tick
+            }
+            LOG_INF("Queued double tap delivered (%lld ms late)", age);
+        }
+        memmove(&pending_double_taps[0], &pending_double_taps[1],
+                sizeof(pending_double_taps[0]) * (PENDING_DOUBLE_TAPS - 1));
+        pending_double_tap_count--;
+    }
 }
 
 static inline void notify_long_tap()
@@ -178,6 +222,7 @@ static u_int8_t btn_last_event = BUTTON_EVENT_NONE;
 void check_button_level(struct k_work *work_item)
 {
     current_time = current_time + 1;
+    flush_pending_double_taps();
 
     u_int8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
 
