@@ -26,6 +26,8 @@
 LOG_MODULE_REGISTER(button, CONFIG_LOG_DEFAULT_LEVEL);
 
 extern bool is_off;
+extern bool is_muted;
+void set_led_state(void); // main.c
 
 static void button_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t button_data_read_characteristic(struct bt_conn *conn,
@@ -218,6 +220,10 @@ void check_button_level(struct k_work *work_item)
     if (event == BUTTON_EVENT_SINGLE_TAP) {
         LOG_INF("single tap detected\n");
         btn_last_event = event;
+
+        is_muted = !is_muted;
+        LOG_INF("Mute %s", is_muted ? "on" : "off");
+        set_led_state();
 
         notify_tap();
     }

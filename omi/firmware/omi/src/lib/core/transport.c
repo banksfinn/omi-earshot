@@ -46,6 +46,7 @@ static bool storage_full_warned = false;
 #endif
 
 extern bool is_connected;
+extern bool is_audio_subscribed;
 #ifdef CONFIG_OMI_ENABLE_BATTERY
 extern bool is_charging;
 #endif
@@ -310,6 +311,9 @@ static const struct bt_data bt_sd[] = {
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
+    // Drives the LED only (main loop picks it up within 1 s). The pusher decides
+    // live-vs-SD per frame with bt_gatt_is_subscribed().
+    is_audio_subscribed = (value == BT_GATT_CCC_NOTIFY);
     if (value == BT_GATT_CCC_NOTIFY) {
         LOG_INF("Client subscribed for notifications");
     } else if (value == 0) {
@@ -672,6 +676,7 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
     mtu_recheck_attempts = 0;
 
     is_connected = false;
+    is_audio_subscribed = false;
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_disable();
@@ -1172,6 +1177,20 @@ bool write_to_storage(void)
 #endif
     return true;
 }
+
+// Hand the partially filled SD record to the SD ring (zero padding = skipped by the
+// reader). Called when live streaming starts so audio stored while the phone was
+// connecting is visible to the drain the app runs right after it subscribes,
+// instead of sitting in RAM until the next disconnect.
+static void flush_partial_storage_record(void)
+{
+    if (buffer_offset == 0) {
+        return;
+    }
+    memset(storage_temp_data + buffer_offset, 0, MAX_WRITE_SIZE - buffer_offset);
+    write_to_file(storage_temp_data, MAX_WRITE_SIZE);
+    buffer_offset = 0;
+}
 #endif
 
 static bool use_storage = true;
@@ -1231,10 +1250,17 @@ void pusher(void)
                 }
             }
 
-            if (conn && is_subscribed) {
+            if (is_subscribed) {
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+                if (is_sd_on()) {
+                    flush_partial_storage_record();
+                }
+#endif
                 push_to_gatt(conn);
-                bt_conn_unref(conn);
-            } else if (!conn) {
+            } else {
+                // No phone, or a phone that is not streaming audio yet (still
+                // discovering / subscribing, or MTU too small): keep the frame on
+                // the SD ring for the app's drain instead of dropping it.
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
                 if (is_sd_on()) {
                     storage_full_warned = false;
@@ -1246,9 +1272,10 @@ void pusher(void)
                     }
                 }
 #endif
-            } else {
+            }
+
+            if (conn) {
                 bt_conn_unref(conn);
-                k_sleep(K_MSEC(10));
             }
         }
     }
@@ -1295,6 +1322,7 @@ int transport_off()
 
     // Ensure all Bluetooth resources are cleaned up
     is_connected = false;
+    is_audio_subscribed = false;
     current_mtu = 0;
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE

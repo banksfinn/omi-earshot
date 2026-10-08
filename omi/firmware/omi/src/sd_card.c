@@ -710,7 +710,7 @@ static void process_write_data_req(const sd_req_t *req)
     }
 }
 
-static void drain_pending_write_queue_for_shutdown(void)
+static void drain_pending_write_queue(void)
 {
     while (1) {
         sd_req_t pending_req;
@@ -980,6 +980,16 @@ void sd_worker_thread(void)
             break;
 
         case REQ_GET_RING_INFO:
+            /* Prio requests jump sd_msgq, so audio already handed to the SD layer
+             * (e.g. recorded while the phone was connecting) could be missing from
+             * write_seq. Commit it first so the INFO the app reads right after it
+             * subscribes covers everything recorded so far. Only when mounted:
+             * unmounted, a full batch could not be flushed and would be discarded. */
+            if (is_mounted) {
+                drain_pending_write_queue();
+                /* A full-batch flush inside the drain re-enters low power. */
+                sd_set_io_low_power(false);
+            }
             if (current_batch_dirty) {
                 (void) flush_current_batch(false);
             }
@@ -1034,7 +1044,7 @@ void sd_worker_thread(void)
             break;
 
         case REQ_UNMOUNT:
-            drain_pending_write_queue_for_shutdown();
+            drain_pending_write_queue();
             res = sd_unmount();
             if (req.u.status.resp) {
                 req.u.status.resp->res = res;
@@ -1048,7 +1058,7 @@ void sd_worker_thread(void)
              * Drain buffered writes first (like the shutdown path) so audio queued
              * just before idle is not lost when we unmount. */
             if (is_mounted) {
-                drain_pending_write_queue_for_shutdown();
+                drain_pending_write_queue();
                 (void) sd_unmount();
                 /* Park the SD chip-select at physical 0 V. The SPI driver otherwise
                  * idles it HIGH, which forward-biases the unpowered card's input

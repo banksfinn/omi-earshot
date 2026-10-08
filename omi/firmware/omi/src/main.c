@@ -34,8 +34,14 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 extern uint8_t battery_percentage;
 #endif
 bool is_connected = false;
+// Phone has enabled notifications on the audio characteristic (set in transport.c).
+// Only connected AND subscribed means audio is actually streaming to the phone.
+bool is_audio_subscribed = false;
 bool is_charging = false;
 bool is_off = false;
+// Single button tap toggles mute. While muted, mic frames are dropped before the
+// codec (nothing streams or records) and all LEDs are held off.
+bool is_muted = false;
 bool blink_toggle = false;
 
 static void print_reset_reason(void)
@@ -84,6 +90,9 @@ static void mic_handler(int16_t *buffer)
 
     // Hardware AAD (T5838) is handled inside mic.c; the mic callback only
     // forwards audio to the codec here.
+    if (is_muted) {
+        return;
+    }
     int err = codec_receive_pcm(buffer, MIC_BUFFER_SAMPLES);
     if (err) {
         LOG_ERR("Failed to process PCM data: %d", err);
@@ -137,11 +146,22 @@ void set_led_state()
         return;
     }
 
+    // Muted: LED off is the mute indicator
+    if (is_muted) {
+        led_off();
+        return;
+    }
+
+    // Blue only means "audio is streaming to the phone". Connected but not yet
+    // streaming (discovery / subscribe pending) is a slow blue blink; audio is
+    // kept on the SD ring meanwhile.
+    bool is_streaming = is_connected && is_audio_subscribed;
+
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
     // If RTC not synced, blink red to warn user to connect phone app
     if (!rtc_is_valid()) {
         set_led_green(is_charging);
-        set_led_blue(!blink_toggle && is_connected);
+        set_led_blue(!blink_toggle && is_streaming);
         set_led_red(blink_toggle);
         blink_toggle = !blink_toggle;
         return;
@@ -161,13 +181,17 @@ void set_led_state()
 #endif
         {
             green = blink_toggle;
-            blue = !blink_toggle && is_connected;
+            blue = !blink_toggle && is_streaming;
             red = !blink_toggle && !is_connected;
             blink_toggle = !blink_toggle;
         }
+    } else if (is_streaming) {
+        blue = true;
+    } else if (is_connected) {
+        blue = blink_toggle;
+        blink_toggle = !blink_toggle;
     } else {
-        blue = is_connected;
-        red = !is_connected;
+        red = true;
     }
 
     set_led_green(green);
