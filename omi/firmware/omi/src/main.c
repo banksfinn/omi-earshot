@@ -138,6 +138,8 @@ static void boot_ready_sequence(void)
     k_msleep(10);
 }
 
+#define LINK_BLINK_PERIOD_S 5
+
 void set_led_state()
 {
     // If device is off, turn off all LEDs immediately
@@ -192,6 +194,21 @@ void set_led_state()
         blink_toggle = !blink_toggle;
     } else {
         red = true;
+    }
+
+    // One green second in every LINK_BLINK_PERIOD_S: the link is flickering (it stalled
+    // audio to the SD ring or dropped in the last minute) or audio is waiting on the ring
+    // for the phone. Charging already uses green, so it's skipped then.
+    static uint8_t link_blink_tick;
+    link_blink_tick = (link_blink_tick + 1) % LINK_BLINK_PERIOD_S;
+    bool link_trouble = transport_link_flaky();
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    link_trouble = link_trouble || sd_ring_has_backlog();
+#endif
+    if (!is_charging && link_trouble && link_blink_tick == 0) {
+        green = true;
+        blue = false;
+        red = false;
     }
 
     set_led_green(green);

@@ -53,4 +53,7 @@ struct bt_conn *get_current_connection();
 int transport_bulk_tx_acquire(k_timeout_t timeout);
 void transport_bulk_tx_release(void);
 
+/** True for a minute after the link stalled audio to the SD ring or dropped (the LED). */
+bool transport_link_flaky(void);
+
 #endif // TRANSPORT_H

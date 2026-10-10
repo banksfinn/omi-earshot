@@ -42,6 +42,8 @@ void sd_request_power(bool on);
 uint32_t write_to_file(uint8_t *data, uint32_t length, uint32_t capture_utc_s);
 
 int sd_ring_get_info(sd_ring_info_t *info);
+/** Audio on the ring the phone hasn't drained yet (a lock-free peek, for the LED). */
+bool sd_ring_has_backlog(void);
 int sd_ring_read(uint64_t start_seq, uint8_t *buf, uint32_t max_bytes, uint32_t *bytes_read, uint32_t *packets_read);
 int sd_ring_advance(uint64_t new_read_seq);
 int sd_ring_advance_async(uint64_t new_read_seq);

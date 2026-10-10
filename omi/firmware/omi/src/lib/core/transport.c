@@ -69,6 +69,11 @@ static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, ui
 static void audio_clock_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 // The pusher sends an audio-clock anchor before the next frame it streams.
 static atomic_t audio_clock_anchor_requested;
+static ssize_t audio_link_read_characteristic(struct bt_conn *conn,
+                                              const struct bt_gatt_attr *attr,
+                                              void *buf,
+                                              uint16_t len,
+                                              uint16_t offset);
 static ssize_t audio_data_read_characteristic(struct bt_conn *conn,
                                               const struct bt_gatt_attr *attr,
                                               void *buf,
@@ -141,6 +146,12 @@ K_WORK_DELAYABLE_DEFINE(mtu_recheck_work, mtu_recheck_work_handler);
 //   valid: the time is pendant UTC epoch ms, otherwise uptime ms. Sent before that
 //   packet, on subscribe, on any capture-time discontinuity and every ~50 frames.
 //   (19B10003 is the speaker characteristic, so the clock takes 19B10004.)
+// - Link (UUID 19B10005-E8F2-537E-4F6C-D104768A1214) the connection as the radio sees it
+//   (read, 24 bytes, LE): [version u8 = 1][tx phy u8][rx phy u8] (1 = 1M, 2 = 2M, 4 = coded)
+//   [interval u16, 1.25 ms units][latency u16][supervision timeout u16, 10 ms units][mtu u16]
+//   [tx data len u16][rx data len u16][stall events u32][stalled frames u32][flags u8]
+//   (bit0 = stalled now). A stalled frame couldn't get a TX slot within AUDIO_TX_STALL_MS
+//   and went to the SD ring; both counters restart on every connect.
 // TODO: The current audio service UUID seems to come from old Intel sample code,
 // we should change it to UUID 814b9b7c-25fd-4acd-8604-d28877beee6d
 static struct bt_uuid_128 audio_service_uuid =
@@ -151,6 +162,8 @@ static struct bt_uuid_128 audio_characteristic_format_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10002, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_clock_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10004, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 audio_characteristic_link_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10005, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
@@ -176,6 +189,12 @@ static struct bt_gatt_attr audio_service_attr[] = {
                            NULL,
                            NULL),
     BT_GATT_CCC(audio_clock_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(&audio_characteristic_link_uuid.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           audio_link_read_characteristic,
+                           NULL,
+                           NULL),
 #ifdef CONFIG_OMI_ENABLE_SPEAKER
     BT_GATT_CHARACTERISTIC(&audio_characteristic_speaker_uuid.uuid,
                            BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
@@ -329,6 +348,50 @@ static const struct bt_data bt_sd[] = {
 //
 // State and Characteristics
 //
+
+/* Link trouble (est #4639, 2026-10-09: a -96 dBm link stalled ~90% of live audio to the
+ * SD ring). Counted per connection for 19B10005; the last trouble (a stall, or the link
+ * dropping) drives the LED's green blink (transport_link_flaky). */
+#define LINK_FLAKY_MS (60 * MSEC_PER_SEC)
+static atomic_t link_stall_events;
+static atomic_t link_stalled_frames;
+static bool audio_link_stalled;
+static int64_t last_link_trouble_ms = -1;
+
+bool transport_link_flaky(void)
+{
+    int64_t at = last_link_trouble_ms;
+    return at >= 0 && k_uptime_get() - at < LINK_FLAKY_MS;
+}
+
+static ssize_t audio_link_read_characteristic(struct bt_conn *conn,
+                                              const struct bt_gatt_attr *attr,
+                                              void *buf,
+                                              uint16_t len,
+                                              uint16_t offset)
+{
+    uint8_t value[24] = {0};
+    struct bt_conn_info info = {0};
+    value[0] = 1;
+    if (bt_conn_get_info(conn, &info) == 0) {
+        if (info.le.phy) {
+            value[1] = info.le.phy->tx_phy;
+            value[2] = info.le.phy->rx_phy;
+        }
+        sys_put_le16(info.le.interval, value + 3);
+        sys_put_le16(info.le.latency, value + 5);
+        sys_put_le16(info.le.timeout, value + 7);
+        if (info.le.data_len) {
+            sys_put_le16(info.le.data_len->tx_max_len, value + 11);
+            sys_put_le16(info.le.data_len->rx_max_len, value + 13);
+        }
+    }
+    sys_put_le16(current_mtu, value + 9);
+    sys_put_le32((uint32_t) atomic_get(&link_stall_events), value + 15);
+    sys_put_le32((uint32_t) atomic_get(&link_stalled_frames), value + 19);
+    value[23] = audio_link_stalled ? 1 : 0;
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, value, sizeof(value));
+}
 
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -641,6 +704,8 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 
     LOG_INF("bluetooth activated");
     current_connection = bt_conn_ref(conn);
+    atomic_set(&link_stall_events, 0);
+    atomic_set(&link_stalled_frames, 0);
     uint16_t mtu = bt_gatt_get_mtu(conn);
     current_mtu = mtu;
 
@@ -708,6 +773,7 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 
     is_connected = false;
     is_audio_subscribed = false;
+    last_link_trouble_ms = k_uptime_get();
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_disable();
@@ -1114,7 +1180,6 @@ static uint8_t pusher_temp_data[MAX_POSSIBLE_MTU];
  * packet can't get a slot within AUDIO_TX_STALL_MS goes to the SD ring instead;
  * while stalled, later frames don't wait at all. */
 #define AUDIO_TX_STALL_MS 100
-static bool audio_link_stalled;
 
 /* Audio clock anchors (see the 19B10004 comment at the top). The phone times the
  * frames between anchors at AUDIO_FRAME_MS each, so an anchor goes out whenever
@@ -1207,7 +1272,12 @@ static int push_to_gatt(struct bt_conn *conn)
         if (index == 0) {
             k_timeout_t wait = audio_link_stalled ? K_NO_WAIT : K_MSEC(AUDIO_TX_STALL_MS);
             if (k_sem_take(&audio_tx_sem, wait) != 0) {
+                if (!audio_link_stalled) {
+                    atomic_inc(&link_stall_events);
+                }
+                atomic_inc(&link_stalled_frames);
                 audio_link_stalled = true;
+                last_link_trouble_ms = k_uptime_get();
                 return -EAGAIN;
             }
             audio_link_stalled = false;

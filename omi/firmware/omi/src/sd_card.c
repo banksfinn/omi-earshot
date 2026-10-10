@@ -240,6 +240,11 @@ static uint64_t ring_used_packets(void)
     return committed + (current_batch_base_seq + current_batch_packets - ring_state.write_seq);
 }
 
+bool sd_ring_has_backlog(void)
+{
+    return ring_state.write_seq != ring_state.read_seq;
+}
+
 static uint64_t ring_used_bytes(void)
 {
     return ring_used_packets() * RAW_AUDIO_PACKET_BYTES;
