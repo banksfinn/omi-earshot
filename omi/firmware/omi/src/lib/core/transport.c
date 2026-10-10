@@ -882,14 +882,18 @@ static struct bt_conn_cb _callback_references = {
 static void update_conn_params(struct bt_conn *conn)
 {
     int err = 0;
+    /* Within Apple's accessory rules (interval min >= 15 ms and a multiple of 15, min == max
+     * == 15 ms allowed, 2 s <= timeout <= 6 s): iOS refused the old 7.5-15 ms request whole
+     * and kept its default 30 ms / 720 ms supervision timeout (19B10005, 2026-10-09), so a
+     * weak link dropped after 0.72 s of missed packets. */
     const struct bt_le_conn_param preferred_param = {
-        .interval_min = 6,
+        .interval_min = 12,
         .interval_max = 12,
         .latency = 0,
         .timeout = 400,
     };
 
-    LOG_INF("Requesting conn params update (7.5-15ms, latency 0)...");
+    LOG_INF("Requesting conn params update (15 ms, latency 0, timeout 4 s)...");
     for (int attempt = 1; attempt <= CONN_PARAM_RETRY_COUNT; attempt++) {
         err = bt_conn_le_param_update(conn, &preferred_param);
         if (!err) {
