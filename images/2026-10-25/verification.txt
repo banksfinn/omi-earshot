@@ -1,0 +1,15 @@
+Image was correctly validated
+Image version: 0.0.0+0
+Image digest: 491fe440506a8d90b85aebf96d5c6b2e78f73edcbb0295501ba39c2173d4e613
+Image was correctly validated
+Image version: 3.0.30+0
+Image digest: 6ab9a5b2a99679f8d2e00ac98453da4661315387f3208310028dbb96af15fd08
+Image was correctly validated
+Image version: 3.0.31+0
+Image digest: e540f4bd2c7f0d6b0fd2b48fd625beae607a7c9783874184f21846f9f8ab52cb
+Signing public key matches generated bootloader key AND preserved stock bootloader bytes
+Public key SHA256: fc5701dc6135e1323847bdc40f04d2e5bee5833b23c29f93593d00018cfa9994
+stock-3.0.29 MCUboot version (0, 0, 0, 0) signed SHA256 ff44f5589b1aa01a4cb60a7ef2439131645ae29d07bf5f0e4316d04f0b72f594 payload SHA256 3d681db666241ffdfe3fc2b52c840fa980f7cef7abef999fc70ca666d01e18be
+weaklink-3.0.30 MCUboot version (3, 0, 30, 0) signed SHA256 cd77c84c79077199dacf2639b06ba29c0d886d7f33eb387a7176b09e38040497 payload SHA256 b50f457326d98e54edbb5adc83890d5c43b8154a10d55433b525204f23faadbd
+rollback-3.0.31-stock MCUboot version (3, 0, 31, 0) signed SHA256 ebeb99a77eeef4c5f1d0b86049dc9925938db835b779d1d12069516b057c877b payload SHA256 3a616921eed567c7dec86c1fb8e976bf0b2038173ea7dfd10814de60babaeefa
+PASS: rollback executable payload is byte-for-byte stock after replacing only DIS 3.0.29 with 3.0.31

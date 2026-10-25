@@ -1,0 +1,4 @@
+Preserved 2026-10-25 before rebuilding. Original build Oct 9 2026.
+Checkout clean: 1dac191934e40378159a1c03bd4ff0b478875a43 (pendant-no-loss).
+Built DIS revision 3.0.29; MCUboot header 0.0.0+0.
+Build predates commit by ~36 s; source matches commit intent, but no app source commit embedded. Exact device provenance cannot be proven without pendant/readback.

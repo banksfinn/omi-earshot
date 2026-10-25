@@ -117,7 +117,8 @@ static ssize_t
 features_read_handler(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
 
 // Forward declarations for update functions and callbacks
-static void update_phy(struct bt_conn *conn);
+static void link_phy_work_handler(struct k_work *work);
+static void link_setup_work_handler(struct k_work *work);
 static void update_data_length(struct bt_conn *conn);
 static void update_mtu(struct bt_conn *conn);
 static void update_conn_params(struct bt_conn *conn);
@@ -132,6 +133,8 @@ static struct bt_gatt_exchange_params exchange_params;
 #define MTU_RECHECK_MAX_ATTEMPTS 6
 static uint8_t mtu_recheck_attempts = 0;
 K_WORK_DELAYABLE_DEFINE(mtu_recheck_work, mtu_recheck_work_handler);
+K_WORK_DELAYABLE_DEFINE(link_phy_work, link_phy_work_handler);
+K_WORK_DELAYABLE_DEFINE(link_setup_work, link_setup_work_handler);
 
 //
 // Service and Characteristic
@@ -727,20 +730,12 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("Initial MTU: %u", mtu);
     mtu_recheck_attempts = 0;
 
-    // Request aggressive connection params for higher BLE sync throughput.
-    update_conn_params(current_connection);
+    // Queue the request now; Zephyr sends it after the configured 1 s guard.
+    update_conn_params(conn);
 
-    // Delay a bit before PHY request to avoid early HCI race on some phones.
-    k_sleep(K_MSEC(300));
-
-    // Initiate PHY, Data Length, and MTU updates
-    update_phy(current_connection);
-
-    // Add a delay before data length and MTU updates as per Nordic example
-    k_sleep(K_MSEC(1000));
-    update_data_length(current_connection);
-    update_mtu(current_connection);
-    schedule_mtu_recheck();
+    // Leave BT RX free to process the weak link while setup procedures settle.
+    k_work_reschedule(&link_phy_work, K_MSEC(300));
+    k_work_reschedule(&link_setup_work, K_MSEC(1300));
 
     is_connected = true;
 
@@ -768,6 +763,8 @@ K_SEM_DEFINE(audio_tx_sem,
 
 static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
+    k_work_cancel_delayable(&link_phy_work);
+    k_work_cancel_delayable(&link_setup_work);
     k_work_cancel_delayable(&mtu_recheck_work);
     mtu_recheck_attempts = 0;
 
@@ -824,10 +821,7 @@ static void _le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t 
             latency,
             supervision_timeout);
 
-    if (interval > 24) {
-        LOG_WRN("Connection interval still high (%u units). Re-requesting preferred params.", interval);
-        update_conn_params(conn);
-    }
+    // The central chooses the final values. Do not start a renegotiation loop.
 }
 
 static void _le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
@@ -872,70 +866,67 @@ static struct bt_conn_cb _callback_references = {
 
 // --- Update Request Functions ---
 
-#define PHY_UPDATE_RETRY_COUNT 3
-#define PHY_UPDATE_RETRY_DELAY_MS 150
-#define MTU_UPDATE_RETRY_COUNT 3
-#define MTU_UPDATE_RETRY_DELAY_MS 120
-#define CONN_PARAM_RETRY_COUNT 3
-#define CONN_PARAM_RETRY_DELAY_MS 300
-
 static void update_conn_params(struct bt_conn *conn)
 {
-    int err = 0;
-    /* Within Apple's accessory rules (interval min >= 15 ms and a multiple of 15, min == max
-     * == 15 ms allowed, 2 s <= timeout <= 6 s): iOS refused the old 7.5-15 ms request whole
-     * and kept its default 30 ms / 720 ms supervision timeout (19B10005, 2026-10-09), so a
-     * weak link dropped after 0.72 s of missed packets. */
+    // Apple accessory range: 15–30 ms, latency 0, 6 s supervision timeout.
     const struct bt_le_conn_param preferred_param = {
         .interval_min = 12,
-        .interval_max = 12,
+        .interval_max = 24,
         .latency = 0,
-        .timeout = 400,
+        .timeout = 600,
     };
-
-    LOG_INF("Requesting conn params update (15 ms, latency 0, timeout 4 s)...");
-    for (int attempt = 1; attempt <= CONN_PARAM_RETRY_COUNT; attempt++) {
-        err = bt_conn_le_param_update(conn, &preferred_param);
-        if (!err) {
-            return;
-        }
-
-        if (attempt < CONN_PARAM_RETRY_COUNT) {
-            LOG_WRN("bt_conn_le_param_update() failed (err %d), retry %d/%d", err, attempt, CONN_PARAM_RETRY_COUNT);
-            k_sleep(K_MSEC(CONN_PARAM_RETRY_DELAY_MS));
-        }
+    int err = bt_conn_le_param_update(conn, &preferred_param);
+    if (err) {
+        LOG_WRN("Connection parameter request failed (err %d)", err);
     }
-
-    LOG_WRN("bt_conn_le_param_update() still failed after retries (last err %d)", err);
 }
 
-static void update_phy(struct bt_conn *conn)
+// The work can race with disconnect. Retain a live connection through the public API.
+static void retain_connected_le(struct bt_conn *conn, void *data)
 {
-    int err = 0;
-    // Prefer 2M PHY for higher throughput
+    struct bt_conn **retained = data;
+    struct bt_conn_info info;
+    if (!*retained && !bt_conn_get_info(conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
+        *retained = bt_conn_ref(conn);
+    }
+}
+
+static void link_phy_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    struct bt_conn *conn = NULL;
+    bt_conn_foreach(BT_CONN_TYPE_LE, retain_connected_le, &conn);
+    if (!conn) {
+        return;
+    }
     const struct bt_conn_le_phy_param preferred_phy = {
         .options = BT_CONN_LE_PHY_OPT_NONE,
-        .pref_rx_phy = BT_GAP_LE_PHY_2M,
-        .pref_tx_phy = BT_GAP_LE_PHY_2M,
+        .pref_rx_phy = BT_GAP_LE_PHY_1M,
+        .pref_tx_phy = BT_GAP_LE_PHY_1M,
     };
-
-    LOG_INF("Requesting PHY update...");
-    for (int attempt = 1; attempt <= PHY_UPDATE_RETRY_COUNT; attempt++) {
-        err = bt_conn_le_phy_update(conn, &preferred_phy);
-        if (!err) {
-            if (attempt > 1) {
-                LOG_INF("PHY update request accepted on retry %d", attempt);
-            }
-            return;
-        }
-
-        if (attempt < PHY_UPDATE_RETRY_COUNT) {
-            LOG_WRN("bt_conn_le_phy_update() failed (err %d), retry %d/%d", err, attempt, PHY_UPDATE_RETRY_COUNT);
-            k_sleep(K_MSEC(PHY_UPDATE_RETRY_DELAY_MS));
-        }
+    // 1M has better receive sensitivity; Opus does not need 2M throughput.
+    int err = bt_conn_le_phy_update(conn, &preferred_phy);
+    if (err) {
+        LOG_WRN("1M PHY request failed (err %d)", err);
     }
+    bt_conn_unref(conn);
+}
 
-    LOG_ERR("bt_conn_le_phy_update() failed after %d retries (last err %d)", PHY_UPDATE_RETRY_COUNT, err);
+static void link_setup_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    struct bt_conn *conn = NULL;
+    bt_conn_foreach(BT_CONN_TYPE_LE, retain_connected_le, &conn);
+    if (!conn) {
+        return;
+    }
+    struct bt_conn_info info;
+    if (!bt_conn_get_info(conn, &info) && info.state == BT_CONN_STATE_CONNECTED) {
+        update_data_length(conn);
+        update_mtu(conn);
+        schedule_mtu_recheck();
+    }
+    bt_conn_unref(conn);
 }
 
 static void update_data_length(struct bt_conn *conn)
@@ -966,7 +957,8 @@ static void mtu_recheck_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    struct bt_conn *conn = current_connection;
+    struct bt_conn *conn = NULL;
+    bt_conn_foreach(BT_CONN_TYPE_LE, retain_connected_le, &conn);
     if (!conn) {
         mtu_recheck_attempts = 0;
         return;
@@ -977,12 +969,14 @@ static void mtu_recheck_work_handler(struct k_work *work)
     if (mtu > 23) {
         LOG_INF("MTU recheck success: negotiated MTU is now %u (payload %u)", mtu, mtu - 3);
         mtu_recheck_attempts = 0;
+        bt_conn_unref(conn);
         return;
     }
 
     mtu_recheck_attempts++;
     LOG_WRN("MTU still %u, re-requesting exchange (%u/%u)", mtu, mtu_recheck_attempts, MTU_RECHECK_MAX_ATTEMPTS);
     update_mtu(conn);
+    bt_conn_unref(conn);
 
     if (mtu_recheck_attempts < MTU_RECHECK_MAX_ATTEMPTS) {
         schedule_mtu_recheck();
@@ -991,35 +985,14 @@ static void mtu_recheck_work_handler(struct k_work *work)
 
 static void update_mtu(struct bt_conn *conn)
 {
-    int err = 0;
-    exchange_params.func = exchange_func; // Set the callback function
-
-    LOG_INF("Requesting MTU exchange...");
-
-    for (int attempt = 1; attempt <= MTU_UPDATE_RETRY_COUNT; attempt++) {
-        err = bt_gatt_exchange_mtu(conn, &exchange_params);
-        if (!err) {
-            return;
-        }
-
-        if (err == -EALREADY) {
-            uint16_t mtu = bt_gatt_get_mtu(conn);
-            current_mtu = mtu;
-            LOG_INF("MTU exchange already in progress/done (err %d). Using MTU: %u", err, mtu);
-            return;
-        }
-
-        if ((err == -EBUSY || err == -EAGAIN) && attempt < MTU_UPDATE_RETRY_COUNT) {
-            LOG_WRN("bt_gatt_exchange_mtu() busy (err %d), retry %d/%d", err, attempt, MTU_UPDATE_RETRY_COUNT);
-            k_sleep(K_MSEC(MTU_UPDATE_RETRY_DELAY_MS));
-            continue;
-        }
-
-        LOG_ERR("bt_gatt_exchange_mtu() failed (err %d)", err);
-        return;
+    exchange_params.func = exchange_func;
+    int err = bt_gatt_exchange_mtu(conn, &exchange_params);
+    if (err == -EALREADY) {
+        current_mtu = bt_gatt_get_mtu(conn);
+    } else if (err) {
+        // The delayed MTU recheck retries busy/temporary failures without blocking.
+        LOG_WRN("MTU exchange request failed (err %d)", err);
     }
-
-    LOG_ERR("bt_gatt_exchange_mtu() failed after retries (last err %d)", err);
 }
 
 static void log_local_ble_addresses(void)

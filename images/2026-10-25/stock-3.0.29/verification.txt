@@ -1,0 +1,5 @@
+Unmodified stock executable payload + MCUboot header reproduced byte-for-byte: TRUE
+Whole signed file differs in cryptographic signature TLV (RSA-PSS is randomized).
+Pocket bundled signed image equals preserved stock signed image: TRUE
+Source baseline reproduced: 1dac191934e40378159a1c03bd4ff0b478875a43
+No pendant connected/read back; running device identity remains reported, not independently verified.
